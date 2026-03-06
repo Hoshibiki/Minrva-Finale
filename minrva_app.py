@@ -544,14 +544,14 @@ def speak_focus():
     threading.Thread(target=_speak, daemon=True).start()
 
 
-def send_ntfy(topic: str, message: str):
+def send_ntfy(topic: str, message: str, title: str = "Minrva Focus Alert"):
     if not topic:
         return
     try:
         requests.post(
             f"https://ntfy.sh/{topic}",
             data=message.encode("utf-8"),
-            headers={"Title": "Minrva Focus Alert", "Priority": "high", "Tags": "warning"},
+            headers={"Title": title, "Priority": "high", "Tags": "warning"},
             timeout=3,
         )
     except Exception:
@@ -706,15 +706,21 @@ def estimate_head_angles_solvepnp(flm, img_shape):
 
 def head_direction_score(yaw_rel, pitch_rel, face_detected, head_sens=1.0):
     if not face_detected: return 0.0
-    YAW_MAX, PITCH_MAX = 60.0, 45.0
+    YAW_MAX, PITCH_MAX = 35.0, 25.0
+    DEAD_YAW, DEAD_PITCH = 12.0, 10.0   # degrees of free movement before any penalty
     base_yaw   = st.session_state.get("base_yaw", 0.0)
     base_pitch = st.session_state.get("base_pitch", 0.0)
     away_yaw   = st.session_state.get("away_yaw", None)
     away_pitch = st.session_state.get("away_pitch", None)
-    yaw_rel_c  = yaw_rel - base_yaw
-    pitch_rel_c= pitch_rel - base_pitch
-    yaw_ratio  = np.clip(abs(yaw_rel_c) / abs(away_yaw - base_yaw + 1e-5), 0, 1) if away_yaw else np.clip(abs(yaw_rel_c) / YAW_MAX, 0, 1)
-    pitch_ratio= np.clip(abs(pitch_rel_c) / abs(away_pitch - base_pitch + 1e-5), 0, 1) if away_pitch else np.clip(abs(pitch_rel_c) / PITCH_MAX, 0, 1)
+    yaw_rel_c   = abs(yaw_rel - base_yaw)
+    pitch_rel_c = abs(pitch_rel - base_pitch)
+    # Apply dead zone — no penalty within ±DEAD degrees of baseline
+    yaw_eff   = max(0.0, yaw_rel_c - DEAD_YAW)
+    pitch_eff = max(0.0, pitch_rel_c - DEAD_PITCH)
+    yaw_range   = abs(away_yaw - base_yaw - DEAD_YAW + 1e-5)   if away_yaw   else (YAW_MAX   - DEAD_YAW)
+    pitch_range = abs(away_pitch - base_pitch - DEAD_PITCH + 1e-5) if away_pitch else (PITCH_MAX - DEAD_PITCH)
+    yaw_ratio   = np.clip(yaw_eff   / max(yaw_range,   1.0), 0, 1)
+    pitch_ratio = np.clip(pitch_eff / max(pitch_range, 1.0), 0, 1)
     return float(np.clip((1.0 - (0.6*yaw_ratio + 0.4*pitch_ratio)) * head_sens, 0, 1))
 
 
@@ -732,9 +738,17 @@ def compute_ear(eye_points):
 def compute_ear_score(face_landmarks, h, w):
     if face_landmarks is None: return 1.0
     lm = face_landmarks.landmark
-    def gc(i): return (lm[i].x*w, lm[i].y*h)
-    avg_ear = (compute_ear([gc(i) for i in EAR_L_P]) + compute_ear([gc(i) for i in EAR_R_P])) / 2.0
-    EAR_OPEN, EAR_CLOSED = 0.25, 0.15
+    def gc(i): return (lm[i].x, lm[i].y)
+    left_ear  = compute_ear([gc(i) for i in EAR_L_P])
+    right_ear = compute_ear([gc(i) for i in EAR_R_P])
+    avg_ear = (left_ear + right_ear) / 2.0
+    # Store raw for diagnostics
+    st.session_state["_diag_ear_left"]  = left_ear
+    st.session_state["_diag_ear_right"] = right_ear
+    st.session_state["_diag_ear_avg"]   = avg_ear
+    # Thresholds calibrated from real measurements:
+    # open eye avg ~0.365, closed eye avg ~0.035
+    EAR_OPEN, EAR_CLOSED = 0.30, 0.08
     if "prev_ear" not in st.session_state: st.session_state["prev_ear"] = avg_ear
     if "blink_counter" not in st.session_state: st.session_state["blink_counter"] = 0
     if "total_frames" not in st.session_state: st.session_state["total_frames"] = 0
@@ -751,14 +765,22 @@ def compute_slouch_score(pose_landmarks, h, w):
     if pose_landmarks is None: return 1.0
     lm = pose_landmarks.landmark
     try:
-        shoulder_y = ((lm[11].y + lm[12].y) / 2.0) * h
-        hip_y      = ((lm[23].y + lm[24].y) / 2.0) * h
-        torso_ratio= abs(shoulder_y - hip_y) / h
-        IDEAL, MIN = 0.3, 0.1
-        if torso_ratio >= IDEAL: return 1.0
-        if torso_ratio <= MIN:   return 0.0
-        return float(np.clip((torso_ratio - MIN) / (IDEAL - MIN), 0, 1))
-    except Exception: return 1.0
+        nose_y     = lm[0].y
+        shoulder_y = (lm[11].y + lm[12].y) / 2.0
+        gap        = shoulder_y - nose_y
+        # Store raw for diagnostics
+        st.session_state["_diag_nose_y"]     = nose_y
+        st.session_state["_diag_shoulder_y"] = shoulder_y
+        st.session_state["_diag_gap"]        = gap
+        # Thresholds calibrated from real measurements:
+        # straight sitting nose_y ~0.37, slouching nose_y ~0.48
+        # Camera is positioned such that nose never goes above 0.37 normally
+        IDEAL_NOSE = 0.42   # score=1.0 at or above this (upright)
+        BAD_NOSE   = 0.55   # score=0.0 at or below this (heavy slouch)
+        score = float(np.clip(1.0 - (nose_y - IDEAL_NOSE) / (BAD_NOSE - IDEAL_NOSE), 0, 1))
+        return score
+    except Exception:
+        return 1.0
 
 
 def compute_emotion_score(face_landmarks, h, w):
@@ -843,12 +865,118 @@ defaults = {
     "score_history": [],
     "raw_score_buffer": [],    # last 5 raw scores for smoothing
     "no_face_since": None,     # timestamp when face was last lost
-    "bg_choice": "None",       # persisted so background survives reruns
-    "sidebar_visible": True,   # controls sidebar show/hide
+    "bg_choice": "None",
+    "sidebar_visible": True,
+    "student_name": "",        # shown in ntfy alerts so teacher knows who
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Force-initialize keys that may be missing from older session states
+for _k, _v in [
+    ("auto_calib_buffer", []),
+    ("auto_calib_done",   False),
+    ("no_face_since",     None),
+    ("last_head_score",   0.5),
+    ("raw_score_buffer",  []),
+    ("_diag_ear_left",    0.0),
+    ("_diag_ear_right",   0.0),
+    ("_diag_ear_avg",     0.0),
+    ("_diag_nose_y",      0.0),
+    ("_diag_shoulder_y",  0.0),
+    ("_diag_gap",         0.0),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# ─────────────────────────────────────────────
+# NAME GATE — must enter name before app loads
+# ─────────────────────────────────────────────
+if not st.session_state["student_name"]:
+    st.markdown("""
+    <style>
+    /* Hide sidebar entirely on the name screen */
+    [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none !important; }
+    [data-testid="stMain"] { margin-left: 0 !important; }
+    .name-gate {
+        max-width: 420px;
+        margin: 8vh auto 0;
+        text-align: center;
+    }
+    .name-gate-owl {
+        font-size: 4rem;
+        margin-bottom: 8px;
+        display: block;
+        animation: float 3s ease-in-out infinite;
+    }
+    @keyframes float {
+        0%, 100% { transform: translateY(0); }
+        50%       { transform: translateY(-10px); }
+    }
+    .name-gate-title {
+        font-family: 'Syne', sans-serif;
+        font-size: 2.4rem;
+        font-weight: 800;
+        color: #7DF9AA;
+        margin: 0;
+        letter-spacing: -0.02em;
+    }
+    .name-gate-sub {
+        font-family: 'Space Mono', monospace;
+        font-size: 11px;
+        color: #5a6070;
+        margin: 8px 0 32px;
+        letter-spacing: 0.06em;
+    }
+    /* Style the text input on this screen */
+    .name-gate-input input {
+        background: #111318 !important;
+        border: 1px solid #1e2230 !important;
+        border-radius: 10px !important;
+        color: #E8EAF0 !important;
+        font-family: 'Space Mono', monospace !important;
+        font-size: 1rem !important;
+        text-align: center !important;
+        padding: 14px !important;
+        transition: border-color 0.2s !important;
+    }
+    .name-gate-input input:focus {
+        border-color: #7DF9AA !important;
+        box-shadow: 0 0 0 2px rgba(125,249,170,0.15) !important;
+    }
+    .name-gate-input input::placeholder { color: #3a4050 !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="name-gate">', unsafe_allow_html=True)
+    st.markdown('<span class="name-gate-owl">🦉</span>', unsafe_allow_html=True)
+    st.markdown('<p class="name-gate-title">Minrva</p>', unsafe_allow_html=True)
+    st.markdown('<p class="name-gate-sub">FOCUS ESTIMATOR · EXHIBITION BUILD</p>', unsafe_allow_html=True)
+
+    st.markdown('<div class="name-gate-input">', unsafe_allow_html=True)
+    entered_name = st.text_input(
+        "Your name",
+        placeholder="Enter your name to begin...",
+        label_visibility="collapsed",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    col_a, col_b, col_c = st.columns([1, 2, 1])
+    with col_b:
+        st.markdown('<div class="btn-primary">', unsafe_allow_html=True)
+        confirm = st.button("Enter Minrva  →", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if confirm:
+        if entered_name.strip():
+            st.session_state["student_name"] = entered_name.strip()
+            st.rerun()
+        else:
+            st.markdown('<p style="font-family:\'Space Mono\',monospace;font-size:11px;color:#FF5C5C;text-align:center;margin-top:8px">Please enter your name first.</p>', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.stop()   # nothing else renders until name is confirmed
 
 # Keep sidebar visible by default on every rerun.
 # The custom hide CSS/state can get "stuck" and make the sidebar appear missing.
@@ -905,10 +1033,19 @@ with st.sidebar:
     enable_tts           = st.checkbox("Voice alert (TTS)", True)
 
     # ── ntfy.sh ──
-    st.markdown('<div class="sidebar-section">Cross-device (ntfy.sh)</div>', unsafe_allow_html=True)
-    ntfy_topic = st.text_input("ntfy.sh topic", placeholder="e.g. minrva-alex", label_visibility="collapsed")
-    if ntfy_topic:
-        st.markdown(f'<p style="font-family:\'Space Mono\',monospace;font-size:10px;color:#5a6070">Subscribe on your phone: ntfy.sh/{ntfy_topic}</p>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section">Remote Monitoring</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="calib-status">Logged in as: <span style="color:#7DF9AA;font-weight:700">{st.session_state["student_name"]}</span></div>',
+        unsafe_allow_html=True
+    )
+    if st.button("← Change name", use_container_width=True):
+        st.session_state["student_name"] = ""
+        st.rerun()
+    ntfy_topic = "minrva-herta-elaina"
+    st.markdown(
+        f'<p style="font-family:\'Space Mono\',monospace;font-size:10px;color:#5a6070">Alerts → ntfy.sh/{ntfy_topic}</p>',
+        unsafe_allow_html=True
+    )
 
     # ── Calibration ──
     st.markdown('<div class="sidebar-section">Head Calibration</div>', unsafe_allow_html=True)
@@ -1104,10 +1241,32 @@ if start_button:
                     cv2.circle(out,(int(lm.x*w),int(lm.y*h)),1,(0,255,0),-1)
 
             # Calibration triggers
+            # ── Auto-calibration: average first 30 good frames as neutral ──
+            AUTO_CALIB_FRAMES = 30
+            if not st.session_state.get("auto_calib_done", False):
+                if face_ok:
+                    st.session_state["auto_calib_buffer"].append((yaw_rel, pitch_rel))
+                n = len(st.session_state["auto_calib_buffer"])
+                if n >= AUTO_CALIB_FRAMES:
+                    yaws    = [y for y, p in st.session_state["auto_calib_buffer"]]
+                    pitches = [p for y, p in st.session_state["auto_calib_buffer"]]
+                    st.session_state["base_yaw"]        = float(np.mean(yaws))
+                    st.session_state["base_pitch"]      = float(np.mean(pitches))
+                    st.session_state["auto_calib_done"] = True
+                else:
+                    pct   = int((n / AUTO_CALIB_FRAMES) * 100)
+                    bar_w = int((n / AUTO_CALIB_FRAMES) * (w - 40))
+                    cv2.rectangle(out, (20, h-50), (w-20, h-30), (20, 28, 40), -1)
+                    cv2.rectangle(out, (20, h-50), (20+bar_w, h-30), (0, 200, 100), -1)
+                    cv2.putText(out, f"Auto-calibrating... {pct}%  look at screen naturally",
+                                (22, h-56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (125, 249, 170), 1)
+
+            # Manual calibration buttons (override)
             if st.session_state.get("calibrate_neutral", False):
                 if face_ok:
-                    st.session_state["base_yaw"]   = yaw_rel
-                    st.session_state["base_pitch"]  = pitch_rel
+                    st.session_state["base_yaw"]        = yaw_rel
+                    st.session_state["base_pitch"]      = pitch_rel
+                    st.session_state["auto_calib_done"] = True
                 st.session_state["calibrate_neutral"] = False
             if st.session_state.get("calibrate_away", False):
                 if face_ok:
@@ -1197,10 +1356,12 @@ if start_button:
                     w_map = {"movement_score": 0.5, "head_direction": 0.3, "slouch_score": 0.2}
                 else:
                     if mode == "Digital":
-                        w_map = {"head_direction": 0.5, "ear_score": 0.3, "slouch_score": 0.2, "emotion_score": 0.0}
+                        # head is most reliable, ear catches drowsiness, slouch catches posture
+                        # emotion removed — consistently broken
+                        w_map = {"head_direction": 0.55, "ear_score": 0.25, "slouch_score": 0.20}
                     elif mode == "Offline":
-                        w_map = {"book_engagement": 0.5, "inferred_hand_activity": 0.2, "slouch_score": 0.2, "emotion_score": 0.1}
-                    else:
+                        w_map = {"book_engagement": 0.5, "inferred_hand_activity": 0.2, "slouch_score": 0.2, "head_direction": 0.1}
+                    else:  # Hybrid
                         w_map = {"switch_score": 0.4, "slouch_score": 0.3, "head_direction": 0.3}
                 active = {k:v for k,v in w_map.items() if v>0}
                 S = sum(active.values())
@@ -1211,9 +1372,9 @@ if start_button:
             focus_score, weights_used = compute_focus(params)
             focus_score = min(focus_score + 0.1, 1.0)
 
-            # ── 3-frame rolling average — smooths out single-frame jitter ──
+            # ── 5-frame rolling average — smooths out single-frame jitter ──
             st.session_state["raw_score_buffer"].append(focus_score)
-            if len(st.session_state["raw_score_buffer"]) > 3:
+            if len(st.session_state["raw_score_buffer"]) > 5:
                 st.session_state["raw_score_buffer"].pop(0)
             focus_score = float(np.mean(st.session_state["raw_score_buffer"]))
 
@@ -1244,9 +1405,10 @@ if start_button:
                         st.session_state["last_notification_time"] = now_time
                         if enable_tts: speak_focus()
                         if ntfy_topic:
+                            name_tag  = st.session_state["student_name"] or "Unknown student"
                             threading.Thread(
                                 target=send_ntfy,
-                                args=(ntfy_topic, f"Focus score {focus_score:.2f} for {grace:.0f}s — get back on task!"),
+                                args=(ntfy_topic, f"Focus dropped to {focus_score:.2f} — distracted for {grace:.0f}s", name_tag),
                                 daemon=True
                             ).start()
                     # Show toast with a countdown hint while in grace window
@@ -1277,24 +1439,39 @@ if start_button:
             stframe.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_container_width=True)
 
             # ── Debug telemetry ──
+            _calib_status = "AUTO ✓" if st.session_state.get("auto_calib_done") else f"warming {len(st.session_state.get('auto_calib_buffer',[]))}/30"
+            _el  = st.session_state.get("_diag_ear_left",  0.0)
+            _er  = st.session_state.get("_diag_ear_right", 0.0)
+            _ea  = st.session_state.get("_diag_ear_avg",   0.0)
+            _ny  = st.session_state.get("_diag_nose_y",    0.0)
+            _shy = st.session_state.get("_diag_shoulder_y",0.0)
+            _gap = st.session_state.get("_diag_gap",       0.0)
             debug_placeholder.markdown(f"""
 ```
-Time          {time.strftime('%H:%M:%S')}
-Mode          {mode_label}
-Focus Score   {focus_score:.3f}
+━━━ FOCUS  {focus_score:.3f}  ━━━  Calibration: {_calib_status}
+           Base yaw:{st.session_state['base_yaw']:.1f}°  pitch:{st.session_state['base_pitch']:.1f}°
 
-Head Score    {head_score:.3f}   Yaw: {yaw_rel:.1f}°  Pitch: {pitch_rel:.1f}°
-EAR Score     {ear_score:.3f}    Slouch: {slouch_score:.3f}
-Emotion Score {emotion_score:.3f}
-Hand (real)   {real_hand:.1f}    Hand (inferred): {inferred_hand_activity:.3f}
-Book Presence {book_presence:.1f}    Book Engagement: {book_engagement_score:.3f}
-Movement      {movement_score:.3f}   Switch: {switch_score:.3f}
-Phone         {'YES  ⚠' if phone_present else 'no'}    Penalty: {applied_phone_pen:.2f}
-Blinks        {st.session_state['blink_counter']} / {st.session_state['total_frames']} frames
+HEAD       score={head_score:.3f}   yaw={yaw_rel:.1f}°  pitch={pitch_rel:.1f}°
 
-Weights       {weights_used}
-```
-""")
+EAR        score={ear_score:.3f}
+           left={_el:.4f}  right={_er:.4f}  avg={_ea:.4f}
+           thresholds: open={0.30}  closed={0.08}
+           → open eye ~0.36, closed eye ~0.035
+
+SLOUCH     score={slouch_score:.3f}
+           nose_y={_ny:.4f}  shoulder_y={_shy:.4f}  gap={_gap:.4f}
+           thresholds: ideal_nose={0.42}  bad_nose={0.55}
+           → straight ~0.37, slouch ~0.48
+
+EMOTION    {emotion_score:.3f}
+HAND real  {real_hand:.1f}    inferred={inferred_hand_activity:.3f}
+BOOK       presence={book_presence:.1f}  engagement={book_engagement_score:.3f}
+MOVEMENT   {movement_score:.3f}   switch={switch_score:.3f}
+PHONE      {'YES ⚠' if phone_present else 'no'}   penalty={applied_phone_pen:.2f}
+BLINKS     {st.session_state['blink_counter']} / {st.session_state['total_frames']} frames
+
+WEIGHTS    {weights_used}
+```""", unsafe_allow_html=False)
 
             if stop_button:
                 break
